@@ -1,51 +1,68 @@
-# PyDoseRT on the Vienna cohort — a minimal demo
+# PyDoseRT validation workspace
 
-A tiny, readable starting point for [PyDoseRT](https://github.com/UMU-DDI/PyDoseRT): load one patient from the
-Vienna prostate cohort, **recompute its treatment-plan dose**, and compare it to the clinical
-ground-truth dose. It also visualizes every intermediate stage of the dose engine.
+Recompute clinical treatment-plan doses with [PyDoseRT](https://github.com/UMU-DDI/PyDoseRT)
+and compare them to what the planning system delivered, on two cohorts:
 
-Three files, that's it:
+- **Vienna** — prostate, NIfTI + `plan_*.json`, Elekta Agility (`elekta_10MV`)
+- **GoldAtlas** — DICOM, the Umeå 10 MV plans (`varian_10MV`), 10 MV arcs only
+
+Two files:
 
 | file | what it does |
 |---|---|
-| `loader.py` | reads a Vienna patient (CT, masks, dose) onto a common grid, and parses `plan.json` into a PyDoseRT `BeamSequence` |
-| `engine.py` | builds the PyDoseRT `DoseEngine` (Elekta machine) and computes dose (full plan, or one beam with intermediates) |
-| `main.py`   | runs the whole thing and makes the plots |
+| `loader.py` | reads a patient of either cohort onto a common 2 mm grid and returns one `Scan`: density, clinical total dose, beams, masks, body, target |
+| `multilattice_lab.py` | builds the engine variants, computes dose, scores gamma, draws the figures, appends every result to `lab/results.csv` |
 
 ## Install
 
 ```bash
-pip install pydosert SimpleITK matplotlib numpy torch
-pip install pymedphys        # optional: enables the gamma map + the --gamma pass rate
+pip install pydosert SimpleITK matplotlib numpy scipy torch pymedphys pydicom
 ```
 
-A CUDA GPU is recommended (falls back to CPU, which is slow).
+A CUDA GPU is expected; it falls back to CPU, which is slow.
 
 ## Run
 
 ```bash
-python main.py --patient_dir /path/to/vienna/0000IVBMJ
-python main.py --patient_dir /path/to/vienna/0000IVBMJ --gamma      # + 2%/2mm gamma
-python main.py --patient_dir /path/to/vienna/0000IVBMJ --cp 90      # visualize control point 90
+python multilattice_lab.py                          # default variants on GoldAtlas
+python multilattice_lab.py --variants L3_kernel L3_kernel_wide
+python multilattice_lab.py --vienna /path/to/vienna --goldatlas ""
+python multilattice_lab.py --limit 2 --beam_maps    # per-control-point mosaics
+python multilattice_lab.py --list                   # the available variants
 ```
 
-A Vienna patient folder must contain `CT_*.nii.gz`, `mask_*_*.nii.gz`, `Dose_0_*.nii.gz`, and
-`plan_*.json`.
+Outputs, all under `--out_dir` (default `lab/`):
 
-## What you'll see
+- `results.csv` — one row per patient × variant, **appended** so runs accumulate, each
+  row stamped with the pydosert revision and whether its working tree was edited
+- `<run>.png` — gamma box plots per variant: whole body, skin shell, deeper
+- `gamma_maps/<cohort>_<patient>.png` — dose, gamma and failure-overlap-vs-baseline
+- `beam_maps/<patient>_arc<N>.png` — every control point's dose alone, one column per
+  variant (`--beam_maps`)
 
-1. **Dose maps** — ground-truth dose, PyDoseRT-recomputed dose, their difference, and a **2%/2mm
-   gamma map** (green = pass, red = fail), overlaid on the CT at a slice through the PTV.
-2. **DVHs** — PTV / Rectum / Bladder, ground truth (solid) vs recomputed (dashed).
-3. **Engine pipeline for one beam** — the four stages PyDoseRT goes through to turn leaf/jaw
-   positions into dose:
-   `fluence map` → `fluence volume` → `radiological depth` → `beam dose`.
+## Variants
+
+`VARIANTS` in `multilattice_lab.py` maps a name to engine settings; add a line to test
+a new one. `baseline_k25` (one central-axis ray for the whole field) and `L1_mu0` (the
+multilattice reduced to a single tile) are forced into every run as controls — the
+multilattice is supposed to beat the first, and should closely reproduce it through the
+second.
+
+`mu_eff` is the residual depth correction applied because a tile's ray is not the voxel
+being scored: `None` is pydosert's own (each tile's depth dose at its own field size),
+a float is a constant attenuation per cm of water, and `0.0` switches it off so only
+the per-tile ray geometry is left.
 
 ## Good to know
 
-- CT/masks and the dose come on **different grids**; `loader.py` resamples everything in physical
-  space onto one common 2 mm isotropic grid first.
-- The plan's `BeamMeterset` is **per-fraction** MU, so the engine dose is multiplied by the number
-  of fractions to get the total dose comparable to `Dose_0`.
-- The Vienna machine is an **Elekta Agility** (80 leaf pairs) → `MachineConfig(preset="elekta_10MV")`.
-- `kernel_size` trades accuracy for speed (25 ≈ accurate; 5 ≈ fast/coarse).
+- Vienna CT/masks and dose come on **different grids**; everything is resampled in
+  physical space onto one 2 mm isotropic grid first.
+- Both cohorts are **padded to a cylinder** about the isocentre, so nothing leaves the
+  array when a slice is rotated to a gantry angle.
+- `BeamMeterset` is **per-fraction** MU, so the engine dose is multiplied by the number
+  of fractions to compare with the clinical dose.
+- The couch is **kept** by default (`--ct_mask none`): the clinical dose was computed
+  with the table in place, and stripping it puts a failing band along the posterior skin.
+- Vienna's `External` is not the patient — it holds body, air gap and couch (44.7 L vs
+  26.4 L for `Body`), so the evaluation region is `Body`, rebuilt from the CT where the
+  RTSTRUCT has none (GoldAtlas).
