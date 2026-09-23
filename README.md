@@ -11,7 +11,7 @@ Two files:
 | file | what it does |
 |---|---|
 | `loader.py` | reads a patient of either cohort onto a common 2 mm grid and returns one `Scan`: density, clinical total dose, beams, masks, body, target |
-| `multilattice_lab.py` | builds the engine variants, computes dose, scores gamma, draws the figures, appends every result to `lab/results.csv` |
+| `engine_lab.py` | builds the engine variants, computes dose, scores gamma, draws the figures, appends every result to `lab/results.csv` |
 
 ## Install
 
@@ -24,11 +24,11 @@ A CUDA GPU is expected; it falls back to CPU, which is slow.
 ## Run
 
 ```bash
-python multilattice_lab.py                          # default variants on GoldAtlas
-python multilattice_lab.py --variants L3_kernel L3_kernel_wide
-python multilattice_lab.py --vienna /path/to/vienna --goldatlas ""
-python multilattice_lab.py --limit 2 --beam_maps    # per-control-point mosaics
-python multilattice_lab.py --list                   # the available variants
+python engine_lab.py                          # default variants on GoldAtlas
+python engine_lab.py --variants cc12 cc24 cc48
+python engine_lab.py --vienna /path/to/vienna --goldatlas ""
+python engine_lab.py --limit 2 --beam_maps    # per-control-point mosaics
+python engine_lab.py --list                   # the available variants
 ```
 
 Outputs, all under `--out_dir` (default `lab/`):
@@ -42,16 +42,37 @@ Outputs, all under `--out_dir` (default `lab/`):
 
 ## Variants
 
-`VARIANTS` in `multilattice_lab.py` maps a name to engine settings; add a line to test
-a new one. `baseline_k25` (one central-axis ray for the whole field) and `L1_mu0` (the
-multilattice reduced to a single tile) are forced into every run as controls — the
-multilattice is supposed to beat the first, and should closely reproduce it through the
-second.
+`VARIANTS` in `engine_lab.py` maps a name to engine settings; add a line to test a new
+one. Two controls are forced into every run:
 
-`mu_eff` is the residual depth correction applied because a tile's ray is not the voxel
-being scored: `None` is pydosert's own (each tile's depth dose at its own field size),
-a float is a constant attenuation per cm of water, and `0.0` switches it off so only
-the per-tile ray geometry is left.
+- `baseline_k25` — the pencil beam the collapsed cone is supposed to beat
+- `cc_off` — `CollapsedConeEngine(apply_correction=False)`, which **must** reproduce
+  the baseline exactly; the run warns if it doesn't, because that's plumbing, not physics
+
+The correction is a ratio, real patient over homogeneous patient, so it is identically
+1 in water and leaves the commissioned output alone. Its knobs: `n_cones` (transport
+directions, cost is linear in it), `correction_clamp` (bounds on the ratio),
+`body_threshold` (density above which a voxel counts as patient in the homogeneous
+reference).
+
+Both engines take the same `--beam_chunk_size`. The collapsed cone computes its
+correction once per chunk from the chunk's summed TERMA; the transport is linear in
+TERMA, so the chunk size is a memory knob there, not a physics one. `--cone_chunk` is
+its second memory knob, backed off first on OOM.
+
+`pencil_k51` is the upgraded pencil beam, `PencilDepthEngine`: FFT convolution with a 51-px (±50 mm) kernel,
+a radiological depth per pencil instead of one per depth plane, no 0.5 mm depth cutoff,
+and the machine preset's electron-contamination term. `fft_k51` is only the larger
+kernel, about three times faster.
+
+`ablation.py` runs `baseline_k25`, then `fft_k51` alone and with each of the other
+changes on its own (`abl_*`), and the full `pencil_k51`. It adds per-cohort tables with
+paired Wilcoxon tests against `baseline_k25` and against `fft_k51`:
+
+```bash
+python ablation.py --limit 3                    # smoke test, GoldAtlas
+python ablation.py --cohort both                # everything
+```
 
 ## Good to know
 

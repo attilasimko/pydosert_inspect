@@ -115,7 +115,11 @@ GOLDATLAS_MACHINE = "varian_10MV"
 # first match wins; the cohorts disagree on what the target is called
 TARGET_NAMES = ["PTV", "PTVT", "CTVT", "CTV"]
 
-# Vienna: nifti structure file name -> the name the mask is stored under
+# Vienna: nifti structure file name -> the name the mask is stored under. The name is
+# a prefix, matched as mask_<name>_*.nii.gz, which is what makes the target work across
+# exports: "PTV" finds mask_PTV_<uid> and mask_PTV_PLOCAL_<uid> alike. Exports also
+# carry water-filled copies (mask_Rectum_W_<uid>), and those sort after the plain organ
+# because a digit sorts before "W", so the plain one is the one picked.
 STRUCTURES = {
     "External": "External",   # the ROI RayStation reported dose in: body + air gap + couch
     "Body": "Body",           # the patient alone
@@ -123,8 +127,10 @@ STRUCTURES = {
     "CTV": "CTV",
     "Rectum": "Rectum",
     "Bladder": "Bladder",
-    "Femur_Head_L": "FemoralHead_L",
+    "Femur_Head_L": "FemoralHead_L",    # older exports
     "Femur_Head_R": "FemoralHead_R",
+    "FemoralHead_L": "FemoralHead_L",   # 2021 harmonized export
+    "FemoralHead_R": "FemoralHead_R",
 }
 # GoldAtlas: requested by name rather than with struct_names=None, which raises --
 # load_structures builds a plain list on the None path and then iterates it as a dict.
@@ -154,6 +160,8 @@ class Scan:
     body           the patient alone, bool numpy -- the evaluation region
     target         the target mask, bool numpy, or None
     fractions      the plan's fractions (beam MU is per fraction)
+    grid           SimpleITK grid the arrays live on, for writing a dose back out
+                   (Vienna only; the GoldAtlas path never needed one)
     """
     case: Case
     density: torch.Tensor
@@ -164,12 +172,27 @@ class Scan:
     target: np.ndarray | None
     target_name: str | None
     fractions: int
+    grid: object | None
 
 
 def find_cases(vienna_root: Path | None, goldatlas_root: Path | None) -> list[Case]:
+    """Every patient under the given cohort roots.
+
+    A Vienna folder still being written by a copy has the CT and masks but not yet the
+    plan and dose, so patients without both are skipped with a note rather than left to
+    fail one by one halfway through a sweep.
+    """
     cases = []
     if vienna_root and Path(vienna_root).is_dir():
         for d in sorted(p for p in Path(vienna_root).iterdir() if p.is_dir()):
+            case_dir = _case_dir(str(d))
+            missing = [what for what, pattern in (("CT", "CT_*.nii.gz"),
+                                                  ("plan", "plan_*.json"),
+                                                  ("dose", "Dose_*.nii.gz"))
+                       if not glob.glob(os.path.join(case_dir, pattern))]
+            if missing:
+                print(f"  skipping vienna/{d.name}: no {' or '.join(missing)}")
+                continue
             cases.append(Case("vienna", d.name, d, VIENNA_MACHINE))
     if goldatlas_root and Path(goldatlas_root).is_dir():
         for d in sorted(p for p in Path(goldatlas_root).iterdir() if p.is_dir()):
@@ -186,14 +209,14 @@ def load_case(case: Case, device: torch.device, ct_mask: str | None = None) -> S
               dose was computed with the table under the patient.
     """
     if case.cohort == "vienna":
-        density, clinical, beams, masks, fractions = _load_vienna(case, device, ct_mask)
+        density, clinical, beams, masks, fractions, grid = _load_vienna(case, device, ct_mask)
     else:
-        density, clinical, beams, masks, fractions = _load_goldatlas(case, device, ct_mask)
+        density, clinical, beams, masks, fractions, grid = _load_goldatlas(case, device, ct_mask)
     target_name, target_t = pick_mask(masks, TARGET_NAMES)
     return Scan(case=case, density=density, clinical=clinical, beams=beams, masks=masks,
                 body=body_mask(density, masks),
                 target=target_t.cpu().numpy().astype(bool) if target_t is not None else None,
-                target_name=target_name, fractions=fractions)
+                target_name=target_name, fractions=fractions, grid=grid)
 
 
 def pick_mask(masks: dict, names: list[str]):
@@ -234,7 +257,15 @@ def _case_dir(patient_dir: str) -> str:
         return patient_dir
     cases = sorted(d for d in glob.glob(os.path.join(patient_dir, "*"))
                    if glob.glob(os.path.join(d, "CT_*.nii.gz")))
-    return cases[0]
+    return cases[0] if cases else patient_dir
+
+
+def vienna_dose_path(patient_dir: str) -> str:
+    """The clinical dose file: Dose_0 where the export has one, else the first Dose_*."""
+    case_dir = _case_dir(patient_dir)
+    files = (sorted(glob.glob(os.path.join(case_dir, "Dose_0_*.nii.gz")))
+             or sorted(glob.glob(os.path.join(case_dir, "Dose_*.nii.gz"))))
+    return files[0]
 
 
 def _reference_grid(ct_img, spacing_mm: float):
@@ -303,9 +334,8 @@ def load_patient(patient_dir: str, spacing_mm: float = SPACING_MM, device="cuda"
         if found:  # nearest-neighbour keeps masks binary
             masks[name] = _resample(sitk.ReadImage(found[0]), ref, sitk.sitkNearestNeighbor) > 0.5
 
-    dose_files = (sorted(glob.glob(os.path.join(case_dir, "Dose_0_*.nii.gz")))
-                  or sorted(glob.glob(os.path.join(case_dir, "Dose_*.nii.gz"))))
-    gt_dose = _resample(sitk.ReadImage(dose_files[0]), ref, sitk.sitkLinear).astype(np.float32)
+    gt_dose = _resample(sitk.ReadImage(vienna_dose_path(patient_dir)), ref,
+                        sitk.sitkLinear).astype(np.float32)
 
     if ct_mask is not None:
         if ct_mask not in masks:
@@ -344,7 +374,8 @@ def load_beam_sequence(patient_dir: str, ref, spacing_mm: float = SPACING_MM, de
     """Parse plan_*.json into a pydosert BeamSequence (one Beam per control point).
 
     Returns:
-        beam_sequence : the full BeamSequence (all arcs, all control points)
+        beam_sequence : the full BeamSequence as delivery segments (all arcs; one fewer
+                        than control points per arc -- see BeamSequence.to_delivery)
         fractions     : number of fractions. BeamMeterset is PER-FRACTION MU, so the
                         engine dose must be multiplied by `fractions` to get the total.
         beams         : the list of individual Beam objects (handy for per-beam demos)
@@ -379,7 +410,14 @@ def load_beam_sequence(patient_dir: str, ref, spacing_mm: float = SPACING_MM, de
                 sid=sad,
                 iso_center=iso,
             ))
-    return BeamSequence.from_beams(beams).to(device).to(torch.float32), fractions, beams
+    # to_delivery: the MU between control points i-1 and i was delivered while the
+    # gantry and leaves moved between them, so it goes to the midpoint angle with the
+    # averaged leaves -- not to control point i, which rotates the whole arc by half a
+    # control-point spacing. GoldAtlas gets the same through load_dicom(use_delivery=True).
+    # Arcs are concatenated; the segment bridging two arcs carries the next arc's first
+    # increment, which is zero, so it delivers nothing.
+    sequence = BeamSequence.from_beams(beams).to_delivery()
+    return sequence.to(device).to(torch.float32), fractions, beams
 
 
 def _load_vienna(case: Case, device, ct_mask):
@@ -387,7 +425,8 @@ def _load_vienna(case: Case, device, ct_mask):
     beam_sequence, fractions, _ = load_beam_sequence(str(case.path), ref, device=device)
     masks = {k: torch.from_numpy(v).to(device) for k, v in masks.items()}
     # Dose_0 is already the total dose
-    return patient.density_image, patient.dose.cpu().numpy(), [beam_sequence], masks, fractions
+    return (patient.density_image, patient.dose.cpu().numpy(), [beam_sequence], masks,
+            fractions, ref)
 
 
 # ------------------------------------------------------------------------ GoldAtlas
@@ -449,7 +488,7 @@ def _load_goldatlas(case: Case, device, ct_mask):
 
     masks = {k: v.to(device) for k, v in patient.structures.items()}
     clinical = patient.dose.cpu().numpy() * fractions   # load_dicom divides by fractions
-    return patient.density_image, clinical, kept, masks, fractions
+    return patient.density_image, clinical, kept, masks, fractions, None
 
 
 def check_energies(plan_path: Path, patient: str, expect_mv: float = 10.0) -> None:

@@ -1,26 +1,30 @@
 """Compare PyDoseRT engine variants against the clinical dose, and log the results.
 
-    python multilattice_lab.py                          # default variants, GoldAtlas
-    python multilattice_lab.py --variants L3_kernel L3_kernel_wide
-    python multilattice_lab.py --vienna /path/to/vienna --goldatlas ""
-    python multilattice_lab.py --limit 2 --beam_maps    # per-control-point mosaics
-    python multilattice_lab.py --list                   # what the variants are
+    python engine_lab.py                              # default variants, GoldAtlas
+    python engine_lab.py --variants cc12 cc24 cc48
+    python engine_lab.py --cohort vienna --variants baseline_k25
+    python engine_lab.py --limit 2 --beam_maps        # per-control-point mosaics
+    python engine_lab.py --list                       # what the variants are
 
-The claim under test is that the multilattice is MORE accurate than the baseline
-pencil beam, which traces one central-axis ray for the whole field. Two controls are
-therefore in every run: the baseline itself, and L=1 with no residual correction,
-which is the same algorithm with its single ray moved to the centroid of the primary
-fluence.
+The claim under test is that the collapsed-cone correction is MORE accurate than the
+bare pencil beam, which deposits dose plane by plane and can never move energy along
+the beam in response to a density change. The correction is a ratio of two cone
+transports, the real patient over a homogeneous one, so in uniform water it is
+identically 1 and the engine reproduces the baseline exactly. Any run containing a
+collapsed-cone variant therefore also gets two controls: `baseline_k25`, and `cc_off`
+-- the collapsed-cone engine with `apply_correction=False`, which must come out
+bit-for-bit equal to it. If it does not, the plumbing is wrong and no variant's number
+means anything. A run of baselines alone gets no controls added, and --no_controls
+turns them off entirely.
 
 The engines keep changing, so a number only means something together with the engine
-that produced it. Every logged row carries the pydosert revision and whether its
-working tree was edited, and rows are APPENDED to <out_dir>/results.csv, so runs
-accumulate instead of overwriting each other.
+that produced it. Every logged row carries the pydosert revision, whether its working
+tree was edited, and the variant's engine settings as JSON, and rows are APPENDED to
+<out_dir>/results.csv, so runs accumulate instead of overwriting each other.
 
 Scored inside the patient only: gamma over the whole body, over a skin shell
-(--shell_mm, where the entry-angle correction acts) and over everything deeper. One
-gamma volume per dose serves all three regions, and its random subset is seeded, so
-paired differences between variants are not sampling noise.
+(--shell_mm) and over everything deeper -- the heterogeneity correction should show up
+in the shell (build-up, oblique entry) and around the bones and bowel gas.
 
 Data loading lives in loader.py; this file is engines, scoring and figures.
 """
@@ -30,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import json
 import subprocess
 import time
 import traceback
@@ -49,33 +54,56 @@ from pydosert.data import MachineConfig
 
 from loader import SPACING_MM, Scan, find_cases, load_case
 
-# name -> engine settings. "kind" picks the engine, the rest are its knobs; anything
-# left out takes the engine's own default. mu_eff is the residual depth correction:
-# None is pydosert's own (each tile's depth dose at its own field size, no free
-# parameter), a float is a constant attenuation per cm of water, and 0.0 switches it
-# off so only the per-tile ray geometry is left.
+# name -> engine settings. "kind" picks the engine -- "baseline" DoseEngine, "pencil"
+# PencilDepthEngine, "cc" CollapsedConeEngine -- and "kernel" the pencil-beam kernel
+# size; everything else is passed straight to the engine, so anything left out keeps
+# the engine's own default. The collapsed-cone knobs are n_cones (transport
+# directions), correction_clamp (bounds on the ratio), body_threshold (the density
+# above which a voxel counts as patient in the homogeneous reference) and
+# apply_correction (off = the baseline, exactly).
 VARIANTS: dict[str, dict] = {
-    "baseline_k25": dict(kind="baseline", lattice=0, kernel=25),
-    "baseline_k5": dict(kind="baseline", lattice=0, kernel=5),
-    "L1_mu0": dict(kind="multilattice", lattice=1, kernel=25, mu_eff=0.0),
-    "L1_kernel": dict(kind="multilattice", lattice=1, kernel=25, mu_eff=None),
-    "L3_mu0": dict(kind="multilattice", lattice=3, kernel=25, mu_eff=0.0),
-    "L3_kernel": dict(kind="multilattice", lattice=3, kernel=25, mu_eff=None),
-    "L3_kernel_wide": dict(kind="multilattice", lattice=3, kernel=25, mu_eff=None,
-                           cf_clamp=(0.05, 20.0)),
-    "L3_mu005": dict(kind="multilattice", lattice=3, kernel=25, mu_eff=0.05),
-    "L3_ss2": dict(kind="multilattice", lattice=3, kernel=25, mu_eff=None,
-                   ray_supersample=2),
-    "L5_mu0": dict(kind="multilattice", lattice=5, kernel=25, mu_eff=0.0),
-    "L5_kernel": dict(kind="multilattice", lattice=5, kernel=25, mu_eff=None),
+    # the published baseline: the engine's default depth cutoff is now 0, so the
+    # 0.5 mm it was written with is pinned here to keep old runs comparable
+    "baseline_k25": dict(kind="baseline", kernel=25, depth_threshold_mm=0.5),
+    "baseline_k5": dict(kind="baseline", kernel=5, depth_threshold_mm=0.5),
+    # the upgraded pencil beam, PencilDepthEngine: FFT convolution, so a 51-px (+-50 mm)
+    # kernel costs no more than 25 px; per-pencil radiological depth; no depth cutoff
+    # (its default); the machine's electron contamination. fft_k51 is only the larger
+    # kernel, on DoseEngine -- ~3x faster.
+    "pencil_k51": dict(kind="pencil", kernel=51, electron_contamination=True),
+    "fft_k51": dict(kind="baseline", kernel=51, conv_backend="fft", depth_threshold_mm=0.5),
+    # its ablation (ablation.py): fft_k51 with exactly one of pencil_k51's other changes
+    "abl_pencil": dict(kind="pencil", kernel=51, depth_threshold_mm=0.5),
+    "abl_no_cutoff": dict(kind="baseline", kernel=51, conv_backend="fft", depth_threshold_mm=0.0),
+    "abl_contam": dict(kind="baseline", kernel=51, conv_backend="fft", depth_threshold_mm=0.5,
+                       electron_contamination=True),
+    # both of those together: pencil_k51 without the per-pencil depth
+    "fft_k51_nc_contam": dict(kind="baseline", kernel=51, conv_backend="fft",
+                              depth_threshold_mm=0.0, electron_contamination=True),
+    "cc_off": dict(kind="cc", kernel=25, apply_correction=False),
+    "cc12": dict(kind="cc", kernel=25, n_cones=12),
+    "cc24": dict(kind="cc", kernel=25, n_cones=24),
+    "cc48": dict(kind="cc", kernel=25, n_cones=48),
+    "cc24_wide": dict(kind="cc", kernel=25, n_cones=24, correction_clamp=(0.2, 5.0)),
+    "cc24_body05": dict(kind="cc", kernel=25, n_cones=24, body_threshold=0.5),
+    "cc24_s025": dict(kind="cc", kernel=25, n_cones=24, correction_strength=0.25),
+    "cc24_s050": dict(kind="cc", kernel=25, n_cones=24, correction_strength=0.50),
 }
-DEFAULT = ["L3_mu0", "L3_kernel", "L5_kernel"]
-CONTROLS = ["baseline_k25", "L1_mu0"]
+DEFAULT = ["cc24"]
+CONTROLS = ["baseline_k25", "cc_off"]
+
+GOLDATLAS_ROOT = Path("/home/bolo/Documents/PyDoseRT/test_data/GoldAtlasPlans/10X")
+# 2021 harmonized export, Elekta Versa HD ("Versa_E" in the plan JSON), all 10 MV,
+# one "Case 1" per patient, prescriptions of 20 and 7 fractions
+VIENNA_ROOT = Path("/media/bolo/f4616a95-e470-4c0f-a21e-a75a8d283b9e/RAW/nifti_harmonized")
+# knobs forwarded to the engine; everything else in a variant is for this script
+ENGINE_KEYS = ("n_cones", "point_kernel", "correction_clamp", "body_threshold",
+               "apply_correction", "correction_strength", "conv_backend",
+               "depth_threshold_mm", "electron_contamination", "depth_nodes_mm")
 
 FIELDS = ["run", "pydosert_rev", "dirty", "timestamp", "cohort", "patient", "variant",
-          "kind", "lattice", "kernel", "mu_eff", "cf_clamp", "ray_supersample",
-          "gamma", "gamma_shell", "gamma_deep", "mae_Gy", "target_ratio", "max_err_pct",
-          "seconds", "peak_gb"]
+          "kind", "kernel", "settings", "gamma", "gamma_shell", "gamma_deep", "mae_Gy",
+          "target_ratio", "max_err_pct", "seconds", "peak_gb"]
 
 
 def free() -> None:
@@ -96,14 +124,24 @@ def pydosert_revision() -> tuple[str, bool]:
 
 # ---------------------------------------------------------------------- the engines
 
-def build_engine(v: dict, beam_sequence, shape, machine: str, device, beam_chunk: int,
-                 tile_chunk: int):
+def build_engine(v: dict, beam_sequence, shape, machine: str, device, args,
+                 beam_chunk: int, cone_chunk: int):
     """One engine, built and calibrated, for the variant `v`.
 
-    Calibrated after construction rather than with auto_calibrate=True, so both
-    engines take an identical path and calibration is not a confound between
-    variants. calibrate() ends by clearing layers_initialized, so the real beam
-    template is rebuilt on the next compute_dose.
+    Calibrated after construction rather than with auto_calibrate=True, so every
+    variant takes an identical path and calibration is not a confound. calibrate()
+    ends by clearing layers_initialized, so the real beam template is rebuilt on the
+    next compute_dose. The calibration phantom is uniform water, where the
+    collapsed-cone ratio is identically 1, so all variants calibrate to the same
+    absolute output.
+
+    Every engine gets the same beam_chunk_size. The collapsed-cone engine needs it
+    at least as much as the baseline: it asks the base class for its intermediates,
+    which suppresses their early release, and it then rotates the chunk's fluence
+    into the patient frame on top of that. Its correction is computed once per
+    chunk from the TERMA summed over the chunk's beams, and since the transport is
+    linear in TERMA that equals the dose-weighted mean of the per-beam corrections
+    -- so the chunk size is a memory knob here, not a physics one.
     """
     common = dict(machine_config=MachineConfig(preset=machine),
                   kernel_size=v["kernel"],
@@ -111,37 +149,40 @@ def build_engine(v: dict, beam_sequence, shape, machine: str, device, beam_chunk
                   dose_grid_shape=tuple(shape),
                   beam_template=beam_sequence,
                   auto_calibrate=False,
-                  dtype=torch.float16,
-                  device=device,
-                  beam_chunk_size=beam_chunk)
-    if v["kind"] == "baseline":
-        engine = PDRT.DoseEngine(**common)
+                  dtype=args.dtype,
+                  device=device)
+    if v["kind"] in ("baseline", "pencil"):
+        cls = PDRT.DoseEngine if v["kind"] == "baseline" else PDRT.PencilDepthEngine
+        engine = cls(**common, beam_chunk_size=beam_chunk,
+                     **{k: v[k] for k in ENGINE_KEYS if k in v})
     else:
         # imported here, not at module scope, so the baseline still runs against a
-        # pydosert without the multilattice engine
-        from pydosert.engine.multilattice_engine import MultilatticeEngine
+        # pydosert without the collapsed-cone engine
+        from pydosert.engine.collapsed_cone import CollapsedConeEngine
 
-        extra = {k: v[k] for k in ("mu_eff", "cf_clamp", "ray_supersample") if k in v}
-        engine = MultilatticeEngine(**common, lattice_size=max(v["lattice"], 1),
-                                    tile_chunk=tile_chunk, **extra)
+        engine = CollapsedConeEngine(**common, beam_chunk_size=beam_chunk,
+                                     cone_chunk=cone_chunk,
+                                     **{k: v[k] for k in ENGINE_KEYS if k in v})
     engine.calibrate(verbose=False)
     return engine
 
 
-def compute_dose(v: dict, scan: Scan, device, beam_chunk: int, tile_chunk: int) -> np.ndarray:
+def compute_dose(v: dict, scan: Scan, device, args) -> np.ndarray:
     """Total dose in Gy, summed over every beam of the plan.
 
-    On CUDA OOM the two documented memory knobs are backed off and the whole
-    calculation retried: beam_chunk_size first (it bounds the [B*G,D,H,W] tensors that
-    dominate), then tile_chunk (tiles in flight, multilattice only). A sweep meets a
-    range of grid sizes and one fixed pair of knobs will not fit all of them.
+    On CUDA OOM a memory knob is backed off and the whole calculation retried:
+    beam_chunk_size bounds the [B*G,D,H,W] tensors that dominate both engines;
+    cone_chunk bounds the cone directions transported at once, and is tried first
+    for the collapsed cone because it is the cheaper of the two to shrink. A sweep
+    meets a range of grid sizes and one fixed setting will not fit all of them.
     """
+    beam_chunk, cone_chunk = args.beam_chunk_size, args.cone_chunk
     while True:
         try:
             total = None
             for bs in scan.beams:
                 engine = build_engine(v, bs, scan.density.shape, scan.case.machine,
-                                      device, beam_chunk, tile_chunk)
+                                      device, args, beam_chunk, cone_chunk)
                 with torch.no_grad():
                     d = engine.compute_dose(bs, density_image=scan.density)[0].float()
                 total = d if total is None else total + d
@@ -151,14 +192,14 @@ def compute_dose(v: dict, scan: Scan, device, beam_chunk: int, tile_chunk: int) 
         except torch.OutOfMemoryError:
             total = None
             free()
-            if beam_chunk > 1:
+            if v["kind"] == "cc" and cone_chunk > 1:
+                cone_chunk = max(1, cone_chunk // 2)
+            elif beam_chunk > 1:
                 beam_chunk = max(1, beam_chunk // 2)
-            elif v["kind"] != "baseline" and tile_chunk > 1:
-                tile_chunk = max(1, tile_chunk // 2)
             else:
                 raise
             print(f"      OOM -> retry with beam_chunk={beam_chunk} "
-                  f"tile_chunk={tile_chunk}", flush=True)
+                  f"cone_chunk={cone_chunk}", flush=True)
 
 
 # ---------------------------------------------------------------------- the scoring
@@ -309,12 +350,12 @@ def _tile(den: np.ndarray, dose: np.ndarray, vmax: float, skin: np.ndarray) -> n
 def beam_maps(scan: Scan, args, device, out_dir: Path) -> None:
     """Every control point's dose on its own, one row each, one column per variant.
 
-    Summed over an arc, an entrance offset is smeared across hundreds of gantry
-    angles; a single beam shows exactly where each variant starts depositing dose
-    relative to the skin (white line). The axial plane through the isocentre holds
-    every beam's central plane, since the gantry rotates about that axis. There is no
-    clinical dose per control point, so each row is scaled to its own maximum across
-    the variants, which keeps the columns of a row directly comparable.
+    Summed over an arc, a heterogeneity effect at one entry angle is smeared across
+    hundreds of gantry angles; a single beam shows exactly where each variant deposits
+    dose relative to the skin (white line) and the bones. The axial plane through the
+    isocentre holds every beam's central plane, since the gantry rotates about that
+    axis. There is no clinical dose per control point, so each row is scaled to its own
+    maximum across the variants, which keeps the columns of a row comparable.
 
     One engine per variant is built once and re-targeted per control point:
     compute_dose re-initialises the geometry for a new gantry angle without
@@ -336,8 +377,8 @@ def beam_maps(scan: Scan, args, device, out_dir: Path) -> None:
     for name in args.variants:
         a0, i0 = cps[0]
         engine = build_engine(VARIANTS[name], scan.beams[a0].slice(i0, i0 + 1),
-                              scan.density.shape, scan.case.machine, device,
-                              args.beam_chunk_size, args.tile_chunk)
+                              scan.density.shape, scan.case.machine, device, args,
+                              1, args.cone_chunk)
         out = np.empty((len(cps), h, w), dtype=np.float32)
         with torch.no_grad():
             for r, (a, i) in enumerate(cps):
@@ -395,8 +436,8 @@ def beam_maps(scan: Scan, args, device, out_dir: Path) -> None:
 
 def run_patient(case, args, device, writer, meta: dict) -> list[dict]:
     scan = load_case(case, device, ct_mask=None if args.ct_mask == "none" else args.ct_mask)
-    body, clinical = scan.body, np.where(scan.body, scan.clinical, 0.0)
-    scan.clinical = clinical
+    body = scan.body
+    scan.clinical = clinical = np.where(body, scan.clinical, 0.0)
     shell = body & (ndi.distance_transform_edt(body, sampling=(SPACING_MM,) * 3)
                     <= args.shell_mm)
     deep = body & ~shell
@@ -414,7 +455,7 @@ def run_patient(case, args, device, writer, meta: dict) -> list[dict]:
             torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         try:
-            pred = compute_dose(v, scan, device, args.beam_chunk_size, args.tile_chunk)
+            pred = compute_dose(v, scan, device, args)
         except Exception:
             print(f"  {case.name} {name}: FAILED")
             traceback.print_exc()
@@ -426,10 +467,8 @@ def run_patient(case, args, device, writer, meta: dict) -> list[dict]:
         slabs[name] = pred[z0:z1].copy()
         g = gamma_volume(clinical, pred, args)
         row = {**meta, "cohort": case.cohort, "patient": case.name, "variant": name,
-               "kind": v["kind"], "lattice": v["lattice"], "kernel": v["kernel"],
-               "mu_eff": v.get("mu_eff", "engine default"),
-               "cf_clamp": v.get("cf_clamp", "engine default"),
-               "ray_supersample": v.get("ray_supersample", 1),
+               "kind": v["kind"], "kernel": v["kernel"],
+               "settings": json.dumps({k: v[k] for k in ENGINE_KEYS if k in v}),
                "gamma": pass_rate(g, body), "gamma_shell": pass_rate(g, shell),
                "gamma_deep": pass_rate(g, deep),
                "mae_Gy": float(np.abs(pred[hot] - clinical[hot]).mean()),
@@ -439,12 +478,13 @@ def run_patient(case, args, device, writer, meta: dict) -> list[dict]:
                "seconds": round(seconds, 1), "peak_gb": round(peak_gb, 2)}
         writer.writerow({k: row[k] for k in FIELDS})
         rows.append(row)
-        print(f"  {case.name:8s} {name:16s} gamma {row['gamma']:5.1f}%  shell {row['gamma_shell']:5.1f}%"
+        print(f"  {case.name:8s} {name:14s} gamma {row['gamma']:5.1f}%  shell {row['gamma_shell']:5.1f}%"
               f"  deep {row['gamma_deep']:5.1f}%  MAE {row['mae_Gy']:.3f} Gy"
-              f"  {row['seconds']:5.1f}s", flush=True)
+              f"  {row['seconds']:6.1f}s", flush=True)
         del pred, g
         free()
 
+    check_controls(slabs, case.name)
     if slabs and not args.no_gamma_maps:
         norm = float(clinical.max())
         gmaps = {n: slice_gamma(clinical[z0:z1], sl, z - z0, z0, args, norm)
@@ -464,6 +504,18 @@ def run_patient(case, args, device, writer, meta: dict) -> list[dict]:
     return rows
 
 
+def check_controls(slabs: dict, patient: str) -> None:
+    """cc_off must reproduce the baseline: with the correction off the collapsed-cone
+    engine is the pencil beam. A difference here is plumbing, not physics."""
+    a, b = CONTROLS
+    if a in slabs and b in slabs:
+        d = np.abs(slabs[a] - slabs[b]).max()
+        scale = float(np.abs(slabs[a]).max()) or 1.0
+        if d > 1e-4 * scale:
+            print(f"  WARNING {patient}: {b} differs from {a} by {100 * d / scale:.3f}% "
+                  f"of max dose; the two should be identical", flush=True)
+
+
 def summarize(rows: list[dict], args, run: str) -> None:
     variants = args.variants
     by = {(r["patient"], r["variant"]): r for r in rows}
@@ -477,13 +529,13 @@ def summarize(rows: list[dict], args, run: str) -> None:
         return float(np.mean([by[(p, v)][key] for p in done]))
 
     print(f"\n=== {run}: means over {len(done)} patients")
-    print(f"{'variant':<16}{'gamma':>8}{'shell':>8}{'deep':>8}{'MAE Gy':>9}{'max err':>9}"
-          f"{'target':>8}{'sec':>7}{'GB':>6}")
+    print(f"{'variant':<14}{'gamma':>8}{'shell':>8}{'deep':>8}{'MAE Gy':>9}{'max err':>9}"
+          f"{'target':>8}{'sec':>8}{'GB':>6}")
     for v in variants:
-        print(f"{v:<16}{mean(v, 'gamma'):8.2f}{mean(v, 'gamma_shell'):8.2f}"
+        print(f"{v:<14}{mean(v, 'gamma'):8.2f}{mean(v, 'gamma_shell'):8.2f}"
               f"{mean(v, 'gamma_deep'):8.2f}{mean(v, 'mae_Gy'):9.3f}"
               f"{mean(v, 'max_err_pct'):8.1f}%{mean(v, 'target_ratio'):8.3f}"
-              f"{mean(v, 'seconds'):7.1f}{mean(v, 'peak_gb'):6.2f}")
+              f"{mean(v, 'seconds'):8.1f}{mean(v, 'peak_gb'):6.2f}")
 
     ref = CONTROLS[0] if CONTROLS[0] in variants else variants[0]
     print(f"\n=== paired against {ref}: mean gain in points (patients improved)")
@@ -495,7 +547,7 @@ def summarize(rows: list[dict], args, run: str) -> None:
             d = np.array([by[(p, v)][key] - by[(p, ref)][key] for p in done])
             cells.append(f"{key.replace('gamma_', ''):5s} {d.mean():+6.2f} "
                          f"({int((d > 0).sum())}/{len(d)})")
-        print(f"  {v:<16} " + "  ".join(cells))
+        print(f"  {v:<14} " + "  ".join(cells))
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     titles = {"gamma": "whole body", "gamma_shell": f"skin shell ({args.shell_mm:g} mm)",
@@ -518,27 +570,57 @@ def summarize(rows: list[dict], args, run: str) -> None:
     print(f"\nfigure -> {path}")
 
 
+def prepare_log(path: Path, fields: list[str] | None = None) -> bool:
+    """True if `path` needs a header written.
+
+    Rows are appended so runs accumulate, which only works while the columns stay the
+    same. When the engine knobs change the columns change with them, so a log written
+    by an older version is moved aside rather than appended to with a different
+    meaning per column.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return True
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+    if header == (fields or FIELDS):
+        return False
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(path.stat().st_mtime))
+    kept = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+    path.rename(kept)
+    print(f"{path.name} was written with different columns; kept as {kept.name}")
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--goldatlas", type=Path,
-                    default=Path("/home/bolo/Documents/PyDoseRT/test_data/GoldAtlasPlans/10X"))
-    ap.add_argument("--vienna", type=Path, default=None)
+    ap.add_argument("--cohort", default="goldatlas", choices=["goldatlas", "vienna", "both"],
+                    help="which cohort to run; the roots below are the defaults for each")
+    ap.add_argument("--goldatlas", type=Path, default=GOLDATLAS_ROOT)
+    ap.add_argument("--vienna", type=Path, default=VIENNA_ROOT)
     ap.add_argument("--out_dir", type=Path, default=Path("lab"))
     ap.add_argument("--variants", nargs="*", default=DEFAULT,
-                    help=f"any of {list(VARIANTS)}; {CONTROLS} are always added")
+                    help=f"any of {list(VARIANTS)}; {CONTROLS} are added alongside any "
+                         f"collapsed-cone variant, as reference and plumbing check")
+    ap.add_argument("--no_controls", action="store_true",
+                    help="run exactly the variants asked for, controls included or not")
     ap.add_argument("--run", default=None, help="label for this run (default: rev + time)")
     ap.add_argument("--list", action="store_true", help="print the variants and exit")
     ap.add_argument("--limit", type=int, default=None, help="first N patients per cohort")
     ap.add_argument("--ct_mask", default="none", choices=["Body", "External", "none"],
                     help="ROI outside which the CT is set to air; 'none' (default) keeps "
                          "the couch, which the clinical dose was computed with")
+    ap.add_argument("--dtype", default="float16", choices=["float16", "float32"],
+                    type=lambda s: getattr(torch, s),
+                    help="engine precision; the collapsed-cone recursion is exercised "
+                         "in float32 by pydosert's own tests")
     ap.add_argument("--shell_mm", type=float, default=25.0)
-    ap.add_argument("--beam_chunk_size", type=int, default=4, help="halved on OOM")
-    ap.add_argument("--tile_chunk", type=int, default=4,
-                    help="multilattice tiles in flight; halved on OOM once beam_chunk is 1")
-    ap.add_argument("--dose_pct", type=float, default=2.0)
-    ap.add_argument("--dist_mm", type=float, default=2.0)
+    ap.add_argument("--beam_chunk_size", type=int, default=4,
+                    help="beams per chunk for both engines, halved on OOM")
+    ap.add_argument("--cone_chunk", type=int, default=4,
+                    help="cone directions transported at once; halved on OOM")
+    ap.add_argument("--dose_pct", type=float, default=1.0)
+    ap.add_argument("--dist_mm", type=float, default=1.0)
     ap.add_argument("--cutoff", type=float, default=10.0)
     ap.add_argument("--subset", type=int, default=20000)
     ap.add_argument("--slab", type=int, default=3,
@@ -555,24 +637,31 @@ def main() -> None:
     args = parse_args()
     if args.list:
         for name, settings in VARIANTS.items():
-            print(f"  {name:<16} {settings}")
+            print(f"  {name:<14} {settings}")
         return
     unknown = [v for v in args.variants if v not in VARIANTS]
     if unknown:
         raise SystemExit(f"unknown variants {unknown}; choose from {list(VARIANTS)}")
-    for c in reversed(CONTROLS):                 # controls first, and always present
-        if c not in args.variants:
-            args.variants.insert(0, c)
+    # The controls are there to interpret a collapsed-cone number: baseline_k25 is what
+    # it has to beat, cc_off is the plumbing check. A run of baselines only needs
+    # neither, so asking for one variant then runs exactly that one variant.
+    if not args.no_controls and any(VARIANTS[v]["kind"] == "cc" for v in args.variants):
+        for c in reversed(CONTROLS):
+            if c not in args.variants:
+                args.variants.insert(0, c)
 
     rev, dirty = pydosert_revision()
     run = args.run or f"{rev}{'-dirty' if dirty else ''}_{datetime.now():%m%d-%H%M}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cases = find_cases(args.vienna, args.goldatlas)
+    roots = {"vienna": args.vienna if args.cohort in ("vienna", "both") else None,
+             "goldatlas": args.goldatlas if args.cohort in ("goldatlas", "both") else None}
+    cases = find_cases(roots["vienna"], roots["goldatlas"])
     if args.limit:
         cases = [c for cohort in ("vienna", "goldatlas")
                  for c in [x for x in cases if x.cohort == cohort][:args.limit]]
     if not cases:
-        raise SystemExit(f"no patients under {args.vienna} / {args.goldatlas}")
+        raise SystemExit("no patients under "
+                         + " / ".join(str(r) for r in roots.values() if r is not None))
     meta = {"run": run, "pydosert_rev": rev, "dirty": int(dirty),
             "timestamp": datetime.now().isoformat(timespec="seconds")}
     print(f"run {run} | pydosert {rev}{' (working tree edited)' if dirty else ''} | "
@@ -581,7 +670,7 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     log = args.out_dir / "results.csv"
-    fresh = not log.exists()
+    fresh = prepare_log(log)
     rows = []
     with open(log, "a", newline="") as f:        # appended: runs accumulate
         writer = csv.DictWriter(f, fieldnames=FIELDS)
